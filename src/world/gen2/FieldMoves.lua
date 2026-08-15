@@ -357,25 +357,6 @@ FieldMoves.STATE_SPRITE = {
   surf_pika = "SPRITE_SURFING_PIKACHU",
 }
 
--- Editor / mod remaps (content-editor playerSprites) land on
--- data.gen2PlayerSprites with Gen1 slot names (walk/bike/surf/surfPikachu).
-local STATE_TO_SLOT = {
-  normal = "walk",
-  bike = "bike",
-  surf = "surf",
-  surf_pika = "surfPikachu",
-}
-
-function FieldMoves.spriteId(data, state)
-  state = state or FieldMoves.PLAYER_NORMAL
-  local slot = STATE_TO_SLOT[state]
-  local ov = data and data.gen2PlayerSprites
-  if slot and type(ov) == "table" and type(ov[slot]) == "string" and ov[slot] ~= "" then
-    return ov[slot]
-  end
-  return FieldMoves.STATE_SPRITE[state] or "SPRITE_CHRIS"
-end
-
 function FieldMoves.isBiking(state)
   return state == FieldMoves.PLAYER_BIKE
 end
@@ -463,18 +444,6 @@ FieldMoves.FLYPOINTS = {
 local FLYPOINT_BY_SPAWN = {}
 for _, row in ipairs(FieldMoves.FLYPOINTS) do
   FLYPOINT_BY_SPAWN[row.spawn] = row
-end
-
--- Mods replace FLYPOINTS wholesale (content-editor Project > FLY POINTS), so
--- the spawn index above -- otherwise a private upvalue -- has to be rebuilt
--- alongside it or hasVisitedSpawn would keep answering off the vanilla rows.
-function FieldMoves.setFlyPoints(rows)
-  if type(rows) ~= "table" then return end
-  FieldMoves.FLYPOINTS = rows
-  for k in pairs(FLYPOINT_BY_SPAWN) do FLYPOINT_BY_SPAWN[k] = nil end
-  for _, row in ipairs(FieldMoves.FLYPOINTS) do
-    FLYPOINT_BY_SPAWN[row.spawn] = row
-  end
 end
 
 -- KANTO_FLYPOINT: the first Kanto row, 1-based here.  FlyMap splits the table

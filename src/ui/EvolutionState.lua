@@ -2,8 +2,8 @@
 -- flashes back and forth with the evolved form, speeding up, then the
 -- new form appears with its cry and the congratulations text.
 -- pokered engine/movie/evolution.asm (Evolution_CheckForCancel) polls the
--- joypad during the flash: holding B aborts the evolution -- the mon keeps
--- its species and _StoppedEvolvingText ("Huh? MON stopped evolving!")
+-- joypad during the flash: a fresh B press aborts the evolution -- the mon
+-- keeps its species and _StoppedEvolvingText ("Huh? MON stopped evolving!")
 -- prints.  Two kinds are exempt: trade evolutions, which evos_moves.asm
 -- routes past the poll entirely (wLinkState == LINK_STATE_TRADING, #213),
 -- and stone evolutions, where the B press is read but thrown away because
@@ -46,7 +46,27 @@ function EvolutionState:sgbPalettes(game)
   return P.wholeNamed(game.data, "MEWMON")
 end
 
-local FLASH_FRAMES = 220
+-- evolution.asm EvolveMon delays 80 frames before .animLoop, polling nothing (#968, #1031)
+local CANCEL_GRACE_FRAMES = 80
+-- .animLoop starts at `lb bc, $1, $10` and runs 8 iterations: iteration k holds
+-- the old pic for c = 18-2k frames inside Evolution_CheckForCancel (72 in all),
+-- then Evolution_BackAndForthAnim swaps b = k times, each swap a pair of
+-- Evolution_ChangeMonPic that end in Delay3 (6 frames a swap, 216 in all).
+local ANIM_LOOP_FRAMES = 288
+local FLASH_FRAMES = CANCEL_GRACE_FRAMES + ANIM_LOOP_FRAMES
+
+-- which pic is on screen t frames into .animLoop
+local function evoShowsNew(t)
+  for b = 1, 8 do
+    local hold = 18 - 2 * b
+    if t < hold then return false end
+    t = t - hold
+    local swap = b * 6
+    if t < swap then return t % 6 < 3 end
+    t = t - swap
+  end
+  return true
+end
 
 local function frontSprite(game, species, mon)
   local path, trueColor = require("src.pokemon.Sprites").path(
@@ -83,10 +103,10 @@ function EvolutionState:update(dt)
   self.t = self.t + 1
   if self.done then return end
   local game = self.game
-  -- evos_moves.asm EvolveMon: each flash iteration polls hJoyHeld and, for
-  -- a cancelable evolution, aborts when B is held -- the mon keeps its
-  -- species (Evolution.apply never runs) and _StoppedEvolvingText prints.
-  if self.cancelable and game.input:isDown("b") then
+  -- evolution.asm Evolution_CheckForCancel reads hJoy5, a fresh edge rather
+  -- than a hold, so B held from the level-up box must not cancel (#968, #1031)
+  if self.cancelable and self.t > CANCEL_GRACE_FRAMES
+     and game.input:wasPressed("b") then
     self.done = true
     self.canceled = true
     local TextBox = require("src.render.TextBox")
@@ -138,14 +158,10 @@ function EvolutionState:draw()
     else
       sprite, spriteTrueColor = self.newSprite, self.newSpriteTrueColor
     end
+  elseif evoShowsNew(self.t - CANCEL_GRACE_FRAMES) then
+    sprite, spriteTrueColor = self.newSprite, self.newSpriteTrueColor
   else
-    local period = math.max(4, 28 - math.floor(self.t / 40) * 6)
-    local showNew = math.floor(self.t / period) % 2 == 1
-    if showNew then
-      sprite, spriteTrueColor = self.newSprite, self.newSpriteTrueColor
-    else
-      sprite, spriteTrueColor = self.oldSprite, self.oldSpriteTrueColor
-    end
+    sprite, spriteTrueColor = self.oldSprite, self.oldSpriteTrueColor
   end
   if sprite then
     local x = math.floor((160 - sprite:getWidth()) / 2)

@@ -354,14 +354,23 @@ function PackMenu:useSelected()
     end
     return
   end
-  -- UseItem's jumptable runs off ITEMATTR's field-menu nibble, and the first
-  -- four entries are all .Oak -- an X ATTACK or a POKé DOLL used from the
-  -- field PACK prints OakThisIsntTheTimeText and goes nowhere.  Only the
-  -- FIELD pack owns that refusal: the battle pack returned above, and the
-  -- catch tutorial's DUDE pack carries a stub world with no useFieldItem at
-  -- all -- its POKE BALL is field-NOUSE and must still reach the throw.
+  -- UseItem's FIELD-pack tail (engine/items/tmhm.asm:73): a TM/HM row opens
+  -- the party to teach, and a field-NOUSE item -- an X ATTACK or a POKé DOLL
+  -- used from the field PACK -- prints OakThisIsntTheTimeText and goes
+  -- nowhere (UseItem's jumptable's first four entries are all .Oak).  Both
+  -- checks live behind `world.useFieldItem` on purpose: DepositSellPack (the
+  -- mart's SELL, the item PC's DEPOSIT) is a chooser whose jumptable is four
+  -- ScrollingMenus and never reaches tmhm.asm, so a TM picked there hands
+  -- its row to onChoose like every other item instead of opening the teach
+  -- party.  The battle pack returned above, and the catch tutorial's DUDE
+  -- pack carries a stub world with no useFieldItem at all -- its POKE BALL
+  -- is field-NOUSE and must still reach the throw.
   if world and world.useFieldItem then
     local def = self.items and self.items[row.id]
+    if def and def.teaches then
+      self:openTeachParty(row)
+      return
+    end
     if def and def.fieldMenu == "ITEMMENU_NOUSE" then
       self.message = OAK_THIS_ISNT_THE_TIME
       return
@@ -584,6 +593,66 @@ function PackMenu:giveToSlot(slot, row)
     return
   end
   held:giveItem(row.id)
+end
+
+-- engine/items/tmhm.asm:73
+function PackMenu:openTeachParty(row)
+  local game = self.game
+  local party = (self.save and self.save.party) or {}
+  if #party == 0 then
+    self.message = NO_POKEMON
+    return
+  end
+  if not (game and game.stack) then return end
+  if not pcall(Screens.get, game, "Gen2PartyMenu") then return end
+  local def = self.items and self.items[row.id]
+  local moveId = def and def.teaches
+  local moves = game.data and game.data.moves
+  local moveDef = moves and moves[moveId]
+  local moveName = (moveDef and moveDef.name) or moveId
+  self.staleRows = true
+  Screens.push(game, "Gen2PartyMenu", {
+    save = self.save,
+    prompt = "teach",
+    tmhm = { move = moveId },
+    onCancel = function()
+      game.stack:pop()
+      self:rebuild()
+    end,
+    onChoose = function(_slot, mon)
+      game.stack:pop()
+      local species = game.data and game.data.pokemon
+        and game.data.pokemon[mon.species]
+      local allowed = false
+      for _, id in ipairs((species and species.tmhm) or {}) do
+        if id == moveId then allowed = true end
+      end
+      if not allowed then
+        if game.say then
+          game:say(("%s can't learn %s!"):format(
+            require("src.battle.gen2.Mon").displayName(mon), moveName))
+        end
+        return
+      end
+      for _, move in ipairs(mon.moves or {}) do
+        if move.id == moveId then
+          if game.say then
+            game:say(("%s already knows %s!"):format(
+              require("src.battle.gen2.Mon").displayName(mon), moveName))
+          end
+          return
+        end
+      end
+      if not game.learnMoveOn then return end
+      game:learnMoveOn(mon, moveId, function(learned)
+        if not learned then return end
+        if tostring(row.id):sub(1, 3) == "HM_" then return end
+        require("src.core.gen2.Happiness").change(mon, "LEARNMOVE")
+        if game.consumeItem then game:consumeItem(row.id) end
+        self:rebuild()
+      end)
+    end,
+  })
 end
 
 function PackMenu:update(_dt)

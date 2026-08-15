@@ -413,7 +413,7 @@ end
 function DayCareMenu:startWithdraw()
   local slot = Breeding.side(self.save, self.side)
   local _, _, grown = Breeding.levelGrowth(self.data, slot)
-  local price = Breeding.retrievePrice(grown, self.data)
+  local price = Breeding.retrievePrice(grown)
   local name = monName(slot.mon)
   self.grown, self.price = grown, price
   local decline = function() self:refuse("ohFine") end

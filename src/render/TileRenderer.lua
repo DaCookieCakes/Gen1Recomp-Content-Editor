@@ -349,13 +349,8 @@ local function buildAnim(spec, tilesetImagePath, perRow, quads, gbc)
   local period = spec.period or ANIM_PERIOD
   local colors
   if gbc then
-    if gbc.gen2 and gbc.tilePalettes then
-      local slot = gbc.tilePalettes[(tiles[1] or 0) + 1] or 1
-      colors = gbc.groupColors and gbc.groupColors[slot]
-    else
-      local group = PaletteFX.worldGroupAt(gbc.tilesetId, gbc.mapId, tiles[1])
-      colors = group and gbc.groupColors[group + 1]
-    end
+    local group = PaletteFX.worldGroupAt(gbc.tilesetId, gbc.mapId, tiles[1])
+    colors = group and gbc.groupColors[group + 1]
   end
   if spec.kind == "hshift" then
     local offsets = spec.offsets
@@ -412,63 +407,6 @@ local gbcAtlasCache = {}
 -- one map are different images and must not share a key.
 local function gbcKeyFor(mapId)
   return "#gbc:" .. mapId .. PaletteFX.darkKey()
-end
-
-local function isGen2Process()
-  local ok, GameVersion = pcall(require, "src.core.GameVersion")
-  return ok and GameVersion and GameVersion.generation
-    and GameVersion.generation() == 2
-end
-
--- Gold / Gen 2: bake the tileset atlas with EnvironmentColorsPointers colors
--- (data.palettes) × tileset.tilePalettes, matching World:bakeMapImage.
-local function getGen2Atlas(imagePath, tilesetDef, mapDef, perRow, data, daytime)
-  if not (imagePath and tilesetDef and mapDef and data and daytime) then
-    return nil
-  end
-  local tilePalettes = tilesetDef.tilePalettes
-  if type(tilePalettes) ~= "table" then return nil end
-  local pals = data.palettes or data.gen2Palettes
-  if type(pals) ~= "table" then return nil end
-  local okP, Palettes = pcall(require, "src.world.gen2.Palettes")
-  if not (okP and Palettes and Palettes.bgSet) then return nil end
-  local bgSet = Palettes.bgSet(pals, mapDef, daytime)
-  if not bgSet then return nil end
-  if daytime == "DARK" and Palettes.withCaveFlicker then
-    bgSet = Palettes.withCaveFlicker(bgSet, 1)
-  end
-
-  local key = imagePath .. "#gen2:" .. tostring(mapDef.id) .. ":" .. daytime
-    .. ":g" .. tostring(mapDef.group or "")
-    .. ":e" .. tostring(mapDef.environment or "")
-    .. ":p" .. tostring(mapDef.palette or "")
-  if gbcAtlasCache[key] ~= nil then return gbcAtlasCache[key] or nil end
-
-  local img = false
-  if love.image and love.image.newImageData then
-    local src = Assets.imageData(imagePath)
-    if src then
-      local iw, ih = src:getDimensions()
-      local total = (iw / 8) * (ih / 8)
-      local out = love.image.newImageData(iw, ih)
-      for t = 0, total - 1 do
-        local slot = tilePalettes[t + 1] or 1
-        local colors = bgSet[slot] or bgSet[1]
-        local ox, oy = (t % perRow) * 8, math.floor(t / perRow) * 8
-        for py = 0, 7 do
-          for px = 0, 7 do
-            local sx, sy = ox + px, oy + py
-            local r, g, b, a = src:getPixel(sx, sy)
-            r, g, b, a = recolorSample(r, g, b, a, colors)
-            out:setPixel(sx, sy, r, g, b, a)
-          end
-        end
-      end
-      img = love.graphics.newImage(out)
-    end
-  end
-  gbcAtlasCache[key] = img
-  return img or nil
 end
 
 local function getGbcAtlas(imagePath, tilesetId, mapId, perRow, data)
@@ -533,59 +471,13 @@ function TileRenderer.new(map, data)
   self.map = map
   self.data = data
   self.image = getImage(map.tileset.image)
-  local iw, ih = self.image:getDimensions()
-  -- Schema marks tilesPerRow optional; fixtures / TMX imports may omit it.
-  -- Derive from atlas width (8px tiles) so preview/load never nil-arithmetics.
-  local perRow = map.tileset.tilesPerRow or math.max(1, math.floor(iw / 8))
-  map.tileset.tilesPerRow = perRow
-
   local gbcCtx
-  if isGen2Process() and data and map.tileset.tilePalettes then
-    local daytime = "DAY"
-    do
-      local okPrev, Preview = pcall(require, "Preview")
-      if okPrev and Preview and Preview.gen2PreviewDaytime then
-        daytime = Preview.gen2PreviewDaytime(nil, map.def) or daytime
-      else
-        local okP, Palettes = pcall(require, "src.world.gen2.Palettes")
-        if okP and Palettes and Palettes.daytimeFor then
-          daytime = Palettes.daytimeFor(map.def, nil, false) or daytime
-        end
-      end
-    end
-    local gbc = getGen2Atlas(map.tileset.image, map.tileset, map.def,
-      perRow, data, daytime)
-    if gbc then
-      self.image = gbc
-      self.gbcAtlas = true
-      self.gen2Atlas = true
-      self.gen2Daytime = daytime
-      iw, ih = self.image:getDimensions()
-      -- Build 8-slot groupColors so animated water/flower overdraw matches.
-      local pals = data.palettes or data.gen2Palettes
-      local okP, Palettes = pcall(require, "src.world.gen2.Palettes")
-      local bgSet = okP and Palettes and Palettes.bgSet
-        and Palettes.bgSet(pals, map.def, daytime)
-      gbcCtx = {
-        tilesetId = map.tileset.id, mapId = map.id,
-        key = "#gen2:" .. map.id .. ":" .. daytime,
-        groupColors = bgSet,
-        imagePath = map.tileset.image,
-        perRow = perRow,
-        gen2 = true,
-        tilePalettes = map.tileset.tilePalettes,
-      }
-      self.gbcCtx = gbcCtx
-      self.gbcAtlasKey = map.tileset.image .. gbcCtx.key
-      self.gbcKeyed = {}
-    end
-  elseif data and PaletteFX.usesGbcPack() and PaletteFX.hasWorldTileset(map.tileset.id) then
+  if data and PaletteFX.usesGbcPack() and PaletteFX.hasWorldTileset(map.tileset.id) then
     local gbc = getGbcAtlas(map.tileset.image, map.tileset.id, map.id,
-                            perRow, data)
+                            map.tileset.tilesPerRow, data)
     if gbc then
       self.image = gbc
       self.gbcAtlas = true
-      iw, ih = self.image:getDimensions()
       -- also recolors the animated water/flower entries below, so they
       -- match the atlas's static tiles instead of showing raw grayscale
       gbcCtx = { tilesetId = map.tileset.id, mapId = map.id, key = gbcKeyFor(map.id),
@@ -594,20 +486,19 @@ function TileRenderer.new(map, data)
       -- (see getKeyedTile): same source image and palette groups, so keep the
       -- context rather than re-deriving it per draw.
       gbcCtx.imagePath = map.tileset.image
-      gbcCtx.perRow = perRow
+      gbcCtx.perRow = map.tileset.tilesPerRow
       self.gbcCtx = gbcCtx
       self.gbcAtlasKey = map.tileset.image .. gbcCtx.key
       self.gbcKeyed = {}
     end
   end
   -- a full-color atlas colors everything it paints, ring and border fill
-  -- included, so every draw entry point claims its rect out of the pass.
-  -- map.def.trueColor wins so a map can opt out of SGB remap without
-  -- forcing every other map that shares the tileset sheet.
-  self.trueColor = (map.def and map.def.trueColor)
-    or map.tileset.trueColor or self.gen2Atlas or nil
+  -- included, so every draw entry point claims its rect out of the pass
+  self.trueColor = map.tileset.trueColor or nil
 
+  local iw, ih = self.image:getDimensions()
   self.quads = {}
+  local perRow = map.tileset.tilesPerRow
   for t = 0, (iw / 8) * (ih / 8) - 1 do
     self.quads[t] = love.graphics.newQuad((t % perRow) * 8,
                                           math.floor(t / perRow) * 8, 8, 8, iw, ih)
@@ -627,12 +518,8 @@ function TileRenderer.new(map, data)
   -- map size either.  Entry order decides which entry claims a tile listed
   -- twice (the vanilla water-then-flower-then-spinner precedence).
   local anims, claimedBy = {}, {}
-  -- `{}` is truthy in Lua; treat an empty list as "use defaults" so a bake
-  -- or import that stamped animatedTiles = {} does not kill water animation.
   local declared = map.tileset.animatedTiles
-  if type(declared) ~= "table" or #declared == 0 then
-    declared = TileRenderer.defaultAnimatedTiles(map.tileset)
-  end
+                   or TileRenderer.defaultAnimatedTiles(map.tileset)
   for _, spec in ipairs(declared) do
     local anim = buildAnim(spec, map.tileset.image, perRow, self.quads, gbcCtx)
     if anim then
@@ -697,26 +584,13 @@ local function ensureWaterBorderFill(self)
   if self.borderWaterTextures then return true end
   local map = self.map
   local perRow = map.tileset.tilesPerRow
-  if not perRow then
-    local img = getImage(map.tileset.image)
-    local iw = img and select(1, img:getDimensions()) or 128
-    perRow = math.max(1, math.floor(iw / 8))
-    map.tileset.tilesPerRow = perRow
-  end
   local colors, gbcKey
   if self.gbcAtlas and self.data then
-    if self.gen2Atlas and self.gbcCtx then
-      local tp = self.gbcCtx.tilePalettes
-      local slot = tp and tp[WATER_TILE + 1] or 1
-      colors = self.gbcCtx.groupColors and self.gbcCtx.groupColors[slot]
-      gbcKey = self.gbcCtx.key
-    else
-      local group = PaletteFX.worldGroupAt(map.tileset.id, map.id, WATER_TILE)
-      local groupColors = PaletteFX.worldGroupColors(
-        self.data, map.tileset.id, map.id, nil)
-      colors = group and groupColors and groupColors[group + 1] or nil
-      gbcKey = gbcKeyFor(map.id)
-    end
+    local group = PaletteFX.worldGroupAt(map.tileset.id, map.id, WATER_TILE)
+    local groupColors = PaletteFX.worldGroupColors(
+      self.data, map.tileset.id, map.id, nil)
+    colors = group and groupColors and groupColors[group + 1] or nil
+    gbcKey = gbcKeyFor(map.id)
   end
   local textures = getShiftVariants(map.tileset.image, perRow, WATER_TILE,
                                     colors, gbcKey)
@@ -820,14 +694,8 @@ local function getKeyedTile(self, tile)
   if cached ~= nil then return cached or nil end
   local img = false
   if ctx.groupColors and love.image and love.image.newImageData then
-    local colors
-    if ctx.gen2 and ctx.tilePalettes then
-      local slot = ctx.tilePalettes[tile + 1] or 1
-      colors = ctx.groupColors[slot]
-    else
-      local group = PaletteFX.worldGroupAt(ctx.tilesetId, ctx.mapId, tile)
-      colors = group and ctx.groupColors[group + 1]
-    end
+    local group = PaletteFX.worldGroupAt(ctx.tilesetId, ctx.mapId, tile)
+    local colors = group and ctx.groupColors[group + 1]
     local src = Assets.imageData(ctx.imagePath)
     local ox = (tile % ctx.perRow) * 8
     local oy = math.floor(tile / ctx.perRow) * 8
@@ -1075,17 +943,12 @@ end
 -- TileRenderer.new re-resolves through the asset search path.  Live
 -- instances keep the batches they already built; MapLoader.invalidateAll
 -- is what drops those (14 §cache-invalidation contract).
-function TileRenderer.clearGbcAtlasCache()
-  gbcAtlasCache = {}
-end
-
 function TileRenderer.invalidate()
   imageCache = {}
   shiftVariants = {}
   frameImages = {}
   toggleImages = {}
   stripData = {}
-  gbcAtlasCache = {}
 end
 
 Assets.register(TileRenderer.invalidate)

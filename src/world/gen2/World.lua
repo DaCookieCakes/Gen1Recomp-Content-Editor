@@ -46,6 +46,7 @@ local Music = require("src.core.Music")
 local NPC = require("src.world.gen2.Npc")
 local Party = require("src.pokemon.Party")
 local Permissions = require("src.world.gen2.Permissions")
+local Pipelines = require("src.render.Pipelines")
 local Player = require("src.world.gen2.Player")
 local Pokerus = require("src.core.gen2.Pokerus")
 local Roamers = require("src.core.gen2.Roamers")
@@ -451,17 +452,8 @@ end
 -- Gen 2 moveset lives in `levelMoves` (EvosAttacks).  So every scripted gift,
 -- the STARTER included, arrived knowing nothing: FIGHT listed no moves and the
 -- battle had no legal action left in it.
---
--- `species` may be a dex index (script operand) or a species id string after a
--- pokemon.before_give remap.
-local function givePokeMon(data, species, level, itemIndex)
-  local id = species
-  if type(species) == "number" then
-    id = speciesByIndex(data.pokemon, species)
-  elseif type(species) ~= "string" or species == ""
-      or not (data.pokemon and data.pokemon[species]) then
-    id = nil
-  end
+local function givePokeMon(data, speciesIndex, level, itemIndex)
+  local id = speciesByIndex(data.pokemon, speciesIndex)
   if not id then return nil end
   return Mon.new(data, id, level or 5, {
     item = itemIndex and itemIndex ~= 0
@@ -629,6 +621,8 @@ function World.new(game)
     -- which is why a cut tree is back the next time you walk in.  Restoring
     -- these at the top of setMap is that refill.
     blockEdits = {},
+    -- engine/overworld/map_setup.asm:78
+    objectSpawns = {},
     -- A field move that is mid-flow (the used-X text, then its effect).
     fieldMove = nil,
     -- ---- state the script VM owns ------------------------------------------
@@ -1070,32 +1064,8 @@ function World:load()
       local save = self.game and self.game.save
       if not (data and save) then return end
       save.party = save.party or {}
-      -- Same mutable pokemon.before_give seam as Gen 1 Commands.give_pokemon
-      -- (species / level / nickname). Elm starters and every other givepoke
-      -- pass through here so one remapper covers both games.
-      local speciesId = type(speciesIndex) == "string" and speciesIndex
-        or speciesByIndex(data.pokemon, speciesIndex)
-      local giftLevel = level or 5
-      local nickname = nil
-      if speciesId and Runtime.wants("pokemon.before_give") then
-        local gift = {
-          ctx = {
-            game = self.game,
-            save = save,
-            overworld = self,
-            mapId = self.map and self.map.id,
-          },
-          species = speciesId,
-          level = giftLevel,
-        }
-        Runtime.emit("pokemon.before_give", gift)
-        speciesId = gift.species or speciesId
-        giftLevel = tonumber(gift.level) or giftLevel
-        nickname = gift.nickname
-      end
-      local mon = givePokeMon(data, speciesId or speciesIndex, giftLevel, item)
+      local mon = givePokeMon(data, speciesIndex, level, item)
       if mon then
-        if nickname then mon.nickname = nickname end
         -- GivePoke -> TryAddMonToParty -> AddPartyMon (move_mon.asm:44-56, :143-149).
         Mon.stampOT(save, mon)
         Party.add(save.party, mon)
@@ -1851,6 +1821,15 @@ function World:moveObject(objectId, cellX, cellY)
   local def = self.map and self.map.def
   local obj = def and def.objects and def.objects[index]
   if not (obj and cellX and cellY) then return end
+  local mapId = self.map and self.map.id
+  local key = obj.index or index
+  if mapId then
+    self.objectSpawns = self.objectSpawns or {}
+    self.objectSpawns[mapId] = self.objectSpawns[mapId] or {}
+    if not self.objectSpawns[mapId][key] then
+      self.objectSpawns[mapId][key] = { obj.x, obj.y }
+    end
+  end
   obj.x, obj.y = cellX, cellY
   local npc = self:objectEntity(objectId)
   if npc and npc ~= self.player then
@@ -3747,6 +3726,16 @@ function World:updateMovement()
   while st.i <= #st.bytes do
     local b = st.bytes[st.i]
     st.i = st.i + 1
+    -- engine/overworld/movement.asm:163
+    if b == 0x57 then
+      local duration = st.bytes[st.i] or 0
+      st.i = st.i + 1
+      if ent.scriptRockSmash then
+        ent:scriptRockSmash(duration)
+      end
+      st.sleep = duration
+      return
+    end
     local act = Movement.decodeByte(b)
     if act.kind == "end" then
       -- SLIDING_F is an object flag, not a stream one, so a stream that never
@@ -3957,7 +3946,8 @@ function World:rollEncounter(kind, terrain, tables, vanilla)
   local ctx = {
     mapId = map and map.id,
     terrain = terrain,
-    rng = love.math.random,
+    -- Same guard World:rockRandom uses: a headless suite has no love global.
+    rng = (love and love.math and love.math.random) or math.random,
     kind = kind,
     daytime = self.daytime,
     environment = map and map.def and map.def.environment,
@@ -5269,6 +5259,38 @@ function World:restoreBlocks()
   return any
 end
 
+function World:restoreObjectSpawns()
+  -- engine/overworld/map_setup.asm:78
+  local spawns = self.objectSpawns
+  if not spawns then return end
+  for mapId, byIndex in pairs(spawns) do
+    local def = self.maps and self.maps[mapId]
+    local objects = def and def.objects
+    if objects then
+      for key, xy in pairs(byIndex) do
+        local obj
+        for _, row in ipairs(objects) do
+          if (row.index or 0) == key then obj = row break end
+        end
+        if obj then
+          obj.x, obj.y = xy[1], xy[2]
+        end
+        local npc = self.npcPool
+          and self.npcPool[string.format("%s_obj_%d", mapId, key)]
+        if npc then
+          npc.cellX, npc.cellY = xy[1], xy[2]
+          npc.px, npc.py = xy[1] * 16, xy[2] * 16
+          npc.homeX, npc.homeY = xy[1], xy[2]
+          npc.moving = false
+          npc.progress = 0
+          npc.targetX, npc.targetY = nil, nil
+        end
+      end
+    end
+    spawns[mapId] = nil
+  end
+end
+
 -- Drop the loaded map's baked canvases and bake again.  Same shape as what
 -- pollTimeOfDay does when the clock rolls the palette over; a block edit
 -- invalidates the bake for the same reason a palette change does.  A world with
@@ -5287,7 +5309,7 @@ end
 -- getting on and off a Lapras a one-byte change rather than an animation.
 function World:applyPlayerState(state)
   self.playerState = state or FieldMoves.PLAYER_NORMAL
-  local name = FieldMoves.spriteId(self.data, self.playerState) or PLAYER_SPRITE
+  local name = FieldMoves.STATE_SPRITE[self.playerState] or PLAYER_SPRITE
   local def = self.sprites and self.sprites[name]
   if def and self.player then
     self.player:setSprite(def)
@@ -5392,8 +5414,10 @@ end
 -- picked, and TextBox reads it back off game.stringBuffer.
 function World:setNickname(mon)
   if not self.game then return end
-  self.game.stringBuffer =
-    (mon and (mon.nickname or mon.name or mon.species)) or ""
+  local name = (mon and (mon.nickname or mon.name or mon.species)) or ""
+  self.game.stringBuffer = name
+  -- engine/events/overworld.asm:1339
+  if self.vm then self.vm.stringBuffer = name end
 end
 
 function World:playMonCry(mon)
@@ -6938,20 +6962,6 @@ function World:setObjectMask(obj, index, masked)
   self.maskScripted[key] = true
 end
 
--- Fixed wilds placed with object.pokemon (content editor / Gen1 shape) stamp
--- save.defeatedTrainers[mapId_obj_N] on win/catch — same key Gen 1 uses — so
--- they stay gone across map reloads even when eventFlag is $FFFF.
-function World:staticWildBeaten(mapId, obj)
-  if not (obj and type(obj.pokemon) == "string" and obj.pokemon ~= "") then
-    return false
-  end
-  local save = self.game and self.game.save
-  local beaten = save and save.defeatedTrainers
-  if type(beaten) ~= "table" then return false end
-  local key = string.format("%s_obj_%d", mapId or "", obj.index or 0)
-  return beaten[key] == true
-end
-
 -- LoadObjectMasks (engine/overworld/map_objects_2.asm:1): ByteFill over the
 -- whole array, then one GetObjectTimeMask / CheckObjectFlag per object.  This
 -- is the ONLY place the event flags decide who is on the map; after it, an
@@ -6968,14 +6978,11 @@ function World:loadObjectMasks(opts)
   local scripted = (opts.keepScripted and self.maskScripted) or {}
   local masks = opts.keepScripted and (self.objectMasks or {}) or {}
   local def = self.map and self.map.def
-  local mapId = def and def.id
   for index, obj in ipairs((def and def.objects) or {}) do
     local key = self:objectMaskKey(obj, index)
     if not scripted[key] then
-      local visible = self.events:objectVisible(obj.eventFlag)
-        and self:objectTimeVisible(obj)
-        and not self:staticWildBeaten(mapId, obj)
-      masks[key] = not visible
+      masks[key] = not (self.events:objectVisible(obj.eventFlag)
+        and self:objectTimeVisible(obj))
     end
   end
   self.objectMasks = masks
@@ -7015,10 +7022,8 @@ function World:rebuildPeople(opts)
     -- falls back to the derivation LoadObjectMasks would have done.
     local masked = self.objectMasks and self.objectMasks[self:objectMaskKey(obj)]
     if masked == nil then
-      local visible = self.events:objectVisible(obj.eventFlag)
-        and self:objectTimeVisible(obj)
-        and not self:staticWildBeaten(self.map.id, obj)
-      masked = not visible
+      masked = not (self.events:objectVisible(obj.eventFlag)
+        and self:objectTimeVisible(obj))
     end
     if not masked then
       local npc = self:pooledNpc(self.map.id, obj)
@@ -7042,8 +7047,7 @@ function World:rebuildPeople(opts)
       local peers = {}
       for _, obj in ipairs(def.objects or {}) do
         if self.events:objectVisible(obj.eventFlag)
-            and self:objectTimeVisible(obj)
-            and not self:staticWildBeaten(nb.id, obj) then
+            and self:objectTimeVisible(obj) then
           local npc = self:pooledNpc(nb.id, obj)
           if npc and ghostMap then
             table.insert(peers, npc)
@@ -7411,44 +7415,6 @@ function World:interactBody()
       -- pokegold LABEL and this looks it up in THIS cache's sfx table, rather
       -- than trusting a numeric id that only holds for the shipped Gold cache.
       function(want, id) return self:sfxIdNamed(want, id) end))
-  end
-  -- Content-editor / Gen1-shaped fixed wild: object.pokemon + level.  Crystal
-  -- statics are normally loadwildmon scripts; this arm lets a map object carry
-  -- the species payload the same way OverworldController:talkTo does on Red.
-  if npc and npc.def and type(npc.def.pokemon) == "string"
-      and npc.def.pokemon ~= "" then
-    self.talkNpc = npc
-    interacted(self, fx, fy, "wild", npc)
-    if npc.facePlayer and self.player then npc:facePlayer(self.player) end
-    local data = self.game and self.game.data
-    local level = tonumber(npc.def.level) or 5
-    -- Content-editor forceShiny: same DV pair as BATTLETYPE_FORCESHINY so a
-    -- catch keeps the shiny colors (flag alone is not enough).
-    local monOpts
-    local forceShiny = npc.def.forceShiny or npc.def.shiny
-    if forceShiny then
-      monOpts = { dvs = { attack = 14, defense = 10, speed = 10,
-        special = 10 } }
-    end
-    local wild = data and Mon.new(data, npc.def.pokemon, level, monOpts)
-    if not wild then
-      self.talkNpc = nil
-      return false
-    end
-    return self:startBattle({
-      wild = wild,
-      battleType = forceShiny and BATTLETYPE_FORCESHINY or nil,
-    }, function(outcome)
-      self.talkNpc = nil
-      -- Match Gen1: win / catch remove the object; lose / run leave it.
-      if outcome == "lose" or outcome == "run" then return end
-      local save = self.game and self.game.save
-      if save then
-        save.defeatedTrainers = save.defeatedTrainers or {}
-        save.defeatedTrainers[npc.id] = true
-      end
-      self:disappearObject((npc.def.index or 0) + 1)
-    end)
   end
   if npc and npc.def and npc.def.scriptKey then
     self.talkNpc = npc
@@ -8394,6 +8360,7 @@ function World:setMap(mapId, cx, cy, facing, opts)
   -- and WHIRLPOOL swapped out goes back: a cut tree is standing again the next
   -- time the map is loaded, and this has to happen before Map.new reads them.
   self:restoreBlocks()
+  self:restoreObjectSpawns()
   -- HandleNewMap (home/map.asm:216-228) runs ResetMapBufferEventFlags before
   -- anything else that touches state: event flags 0-7
   -- (EVENT_TEMPORARY_UNTIL_MAP_RELOAD) die on every map load, which is what
@@ -8480,9 +8447,7 @@ function World:setMap(mapId, cx, cy, facing, opts)
   -- GetWarpDestCoords / EnterMapConnection / EnterMapSpawnPoint write wXCoord
   -- and wYCoord BEFORE HandleNewMap (data/maps/setup_scripts.asm:79-106).
   local face = facing or (self.player and self.player.facing) or "down"
-  local walkId = FieldMoves.spriteId(self.data, FieldMoves.PLAYER_NORMAL)
-    or PLAYER_SPRITE
-  local chris = self.sprites and self.sprites[walkId]
+  local chris = self.sprites and self.sprites[PLAYER_SPRITE]
   if self.player then
     self.player.cellX, self.player.cellY = cx, cy
     self.player.px, self.player.py = cx * 16, cy * 16
@@ -8876,7 +8841,8 @@ function World:tryLedgeJump(dir)
   -- ShakeGrass (engine/overworld/movement.asm:741-770).
   p.inGrass, p.grassShake = false, nil
   p.progress = 0
-  p.stepFrames = Player.STEP_FRAMES
+  -- engine/overworld/map_objects.asm:1163
+  p.stepFrames = Player.STEP_FRAMES * 2
   self:playSfxNamed("Sfx_JumpOverLedge", SFX_JUMP_OVER_LEDGE)
   return true
 end
@@ -9648,11 +9614,13 @@ function World:stepBody()
   -- is a scripted step under World:busy, which returns above this line.
   local dir = self.heldDir
   if not p.moving then
-    local current = Permissions.currentDirection(self:playerCollision())
+    local coll = self:playerCollision()
+    local current = Permissions.currentDirection(coll)
+      or Permissions.doorForcedDirection(coll)
     if current then
       dir = current
     elseif self.turningDirection
-        and Permissions.isIce(self:playerCollision()) then
+        and Permissions.isIce(coll) then
       dir = self.turningDirection
     elseif not dir then
       self.turningDirection = nil
@@ -9708,7 +9676,17 @@ function World:drawGround(s)
   -- clear colour.  LoadMetatiles fills it with wMapBorderBlock instead, and
   -- the connection strips and the map draw straight over the top of it.
   if self.map then
-    local bw, bh = G.getDimensions()
+    -- Destination size must be the CURRENT canvas (tilt grows it past the
+    -- window).  getDimensions() is always the window, so a grown tilt capture
+    -- used to tile the void against the wrong view and the fill drifted off
+    -- the map grid as the camera moved.
+    local canvas = G.getCanvas()
+    local bw, bh
+    if canvas then
+      bw, bh = canvas:getDimensions()
+    else
+      bw, bh = G.getDimensions()
+    end
     BorderFill.draw(self, self:borderImageFor(self.map.id),
       cam.x, cam.y, bw, bh, s, self.map.id)
   end
@@ -9784,50 +9762,102 @@ function World:drawPeople(s, billboard)
     end
   end
 
-  if self.emote and self.emote.image then
-    local e = self.emote
-    local ex = math.floor((e.entity.px - cam.x) * s)
-    local ey = math.floor((e.entity.py - 16 - cam.y) * s)
-    -- SpawnEmote.EmoteObject (engine/overworld/map_objects.asm:2029) spawns the
-    -- bubble as an OBJ on PAL_OW_EMOTE, which LoadMapPals resolves to the
-    -- "silver" row of gfx/overworld/npc_sprites.pal (white / white / RGB
-    -- 13,13,13 / black).  That row is byte-identical in all four daytime
-    -- blocks, so the bubble is the same at any hour, but it still goes through
-    -- the daytime lookup because that is what LoadMapPals does and it keeps the
-    -- emote on the same path as every other OW sprite.  Blitting the extracted
-    -- sheet raw left the interior at the DMG ramp's shade 1 (170 grey) instead
-    -- of white: the Gen 2 repeat of #505.
-    local emoteColors = Palettes.spritePalette(self.palettes,
-      self.daytime or Palettes.daytimeFor(self.map and self.map.def,
-        self:hour(), self.flashUsed),
-      { paletteId = 5 })
-    local function blit()
-      G.setColor(1, 1, 1, 1)
-      G.draw(e.image, ex, ey, 0, s, s)
-    end
-    local function body()
-      -- GbcPalette.with, not useRaw: the DMG and CLASSIC colour modes still
-      -- have to collapse the row to their own ramps, and it restores whatever
-      -- shader the billboard pass had set rather than assuming none.
-      if emoteColors and GbcPalette.available() then
-        GbcPalette.with(emoteColors, blit)
-      else
-        blit()
-      end
-    end
-    if billboard then
-      billboard(ex + 8 * s, ey + 32 * s, body)
+  self:drawEmote(s, billboard)
+  self:drawHealAnim(s, billboard)
+end
+
+-- Split out of drawPeople so World:drawPipeline composites the one copy the
+-- flat and tilt paths draw, not a second transcription of it.
+function World:drawEmote(s, billboard)
+  if not (self.emote and self.emote.image) then return end
+  local G = love.graphics
+  local cam = self.camera
+  local e = self.emote
+  local ex = math.floor((e.entity.px - cam.x) * s)
+  local ey = math.floor((e.entity.py - 16 - cam.y) * s)
+  -- SpawnEmote.EmoteObject (engine/overworld/map_objects.asm:2029) spawns the
+  -- bubble as an OBJ on PAL_OW_EMOTE, which LoadMapPals resolves to the
+  -- "silver" row of gfx/overworld/npc_sprites.pal (white / white / RGB
+  -- 13,13,13 / black).  That row is byte-identical in all four daytime
+  -- blocks, so the bubble is the same at any hour, but it still goes through
+  -- the daytime lookup because that is what LoadMapPals does and it keeps the
+  -- emote on the same path as every other OW sprite.  Blitting the extracted
+  -- sheet raw left the interior at the DMG ramp's shade 1 (170 grey) instead
+  -- of white: the Gen 2 repeat of #505.
+  local emoteColors = Palettes.spritePalette(self.palettes,
+    self.daytime or Palettes.daytimeFor(self.map and self.map.def,
+      self:hour(), self.flashUsed),
+    { paletteId = 5 })
+  local function blit()
+    G.setColor(1, 1, 1, 1)
+    G.draw(e.image, ex, ey, 0, s, s)
+  end
+  local function body()
+    -- GbcPalette.with, not useRaw: the DMG and CLASSIC colour modes still
+    -- have to collapse the row to their own ramps, and it restores whatever
+    -- shader the billboard pass had set rather than assuming none.
+    if emoteColors and GbcPalette.available() then
+      GbcPalette.with(emoteColors, blit)
     else
-      body()
+      blit()
     end
   end
-
-  self:drawHealAnim(s, billboard)
+  if billboard then
+    billboard(ex + 8 * s, ey + 32 * s, body)
+  else
+    body()
+  end
 end
 
 function World:drawWorldBody(s)
   self:drawGround(s)
   self:drawPeople(s)
+end
+
+-- Gold's half of the world-pipeline seam: same ctx keys, same order and the
+-- same nil-falls-back-to-2D rule as src/world/OverworldController.lua:4867.
+function World:drawPipeline(id, w, h, s)
+  local G = love.graphics
+  local cam = self.camera
+  local ctx = {
+    state = self, cam = cam,
+    vw = self.viewW, vh = self.viewH,
+    -- No BG-only shake here: World:draw slides the whole frame through
+    -- camera.y, so the ground row IS the camera row.
+    bgY = cam.y,
+    width = w, height = h, scale = s,
+    level = Pipelines.level(id),
+    -- imageFor keys its bakes by GbcPalette.mode, so the colour is already in
+    -- the art: nil, like Gen 1 returns in its true-colour modes.
+    paletteFor = function() return nil end,
+    spriteColors = function() return nil end,
+    -- Gold's only standing effects; it has no dust/cutTree/bird/rod overlay,
+    -- and Gen 1's `at` skips a nil body, so those keys are simply absent.
+    fx = {
+      emote = function() self:drawEmote(1, nil) end,
+      heal = function() self:drawHealAnim(1, nil) end,
+    },
+  }
+  -- `project(wx, wy)` -> canvas pixels, nil behind the camera.  s = 1 lays the
+  -- closures out in world pixels off the flat foot, the unit Gen 1 uses.
+  ctx.drawFx = function(project, scale)
+    scale = scale or s
+    local function at(fx, fy, body)
+      local sx, sy = project(fx + cam.x, fy + cam.y)
+      if not sx then return end          -- behind the camera
+      G.push()
+      G.scale(scale, scale)
+      G.translate(sx / scale - fx, sy / scale - fy)
+      body()
+      G.pop()
+    end
+    self:drawEmote(1, at)
+    self:drawHealAnim(1, at)
+  end
+  local override = Pipelines.drawWorld(id, ctx)
+  -- world post-processes fold in here, so they never touch the text box on top
+  if override then override = Pipelines.worldPresent(override, ctx) end
+  return override
 end
 
 -- The perspective quad TILT draws the ground onto.  The shader and the
@@ -9841,21 +9871,25 @@ function World:tiltMesh()
   return mesh, shader
 end
 
-function World:drawTilted(w, h, s)
+-- `gw, gh` are the grown capture size from World:draw (Tilt.viewGrowth),
+-- matching Renderer:worldViewSize.  Camera is already followed for that view.
+function World:drawTilted(w, h, s, gw, gh)
   local mesh, shader = self:tiltMesh()
   if not mesh then
     self:drawWorldBody(s)
     return
   end
   local G = love.graphics
+  gw = gw or w
+  gh = gh or h
   -- Linear sampling on the tilt canvas softens the shimmer the perspective
   -- warp would otherwise put on every pixel edge; the flat path keeps nearest.
-  if not self.tiltCanvas or self.tiltCanvas:getWidth() ~= w
-      or self.tiltCanvas:getHeight() ~= h then
+  if not self.tiltCanvas or self.tiltCanvas:getWidth() ~= gw
+      or self.tiltCanvas:getHeight() ~= gh then
     if self.tiltCanvas and self.tiltCanvas.release then
       self.tiltCanvas:release()
     end
-    self.tiltCanvas = G.newCanvas(w, h)
+    self.tiltCanvas = G.newCanvas(gw, gh)
     self.tiltCanvas:setFilter("linear", "linear")
   end
 
@@ -9871,11 +9905,14 @@ function World:drawTilted(w, h, s)
   G.setCanvas(previous)
 
   mesh:setTexture(self.tiltCanvas)
-  mesh:setVertices(Tilt.meshCorners(w, h))
+  mesh:setVertices(Tilt.meshCorners(gw, gh))
+  G.push()
+  G.translate((w - gw) / 2, (h - gh) / 2)
   G.setColor(1, 1, 1, 1)
   G.setShader(shader)
   G.draw(mesh)
   G.setShader()
+  G.pop()
 
   -- ...and the standing things over it, each translated from its flat foot
   -- onto that foot's projection.  Nothing here is sheared or resized: tilt
@@ -9884,10 +9921,10 @@ function World:drawTilted(w, h, s)
     -- The ground quad carries the flat canvas and nothing else, so a foot
     -- outside it has no ground under it; drawing it anyway put NPCs from two
     -- screens away over the border fill, where the map stops being drawn.
-    if not Tilt.onGround(fx, fy, w, h, 32 * s) then return end
-    local sx, sy = Tilt.groundPoint(fx, fy, w, h)
+    if not Tilt.onGround(fx, fy, gw, gh, 32 * s) then return end
+    local sx, sy = Tilt.groundPoint(fx, fy, gw, gh)
     G.push()
-    G.translate(sx - fx, sy - fy)
+    G.translate(sx - fx + (w - gw) / 2, sy - fy + (h - gh) / 2)
     body()
     G.pop()
   end)
@@ -9925,8 +9962,18 @@ function World:draw()
   end
 
   local s = self:zoomScale()
-  local vw = math.ceil(w / s)
-  local vh = math.ceil(h / s)
+  -- Decided before sizing the view: a world pipeline wins over tilt, and tilt
+  -- grows the capture the way Renderer:worldViewSize does on Gen 1 so the
+  -- camera, BorderFill and tilt canvas all share one grid.
+  local pipelineId = Pipelines.worldPipeline()
+  local tilt = (not pipelineId) and Tilt.active() and self:tiltMesh() ~= nil
+  local gw, gh = w, h
+  if tilt then
+    local g = Tilt.viewGrowth()
+    gw, gh = math.ceil(w * g), math.ceil(h * g)
+  end
+  local vw = math.ceil(gw / s)
+  local vh = math.ceil(gh / s)
   if vw % 2 ~= 0 then vw = vw + 1 end
   if vh % 2 ~= 0 then vh = vh + 1 end
   if vw ~= self.viewW or vh ~= self.viewH then
@@ -9943,12 +9990,18 @@ function World:draw()
     self.camera.y = self.camera.y + (self.shake.phase or 0)
   end
 
+  local override = pipelineId and self:drawPipeline(pipelineId, w, h, s) or nil
+
   -- TILT projects the finished world frame, so with it on the map, people and
   -- emote go into a canvas first and that canvas is drawn as a perspective
   -- quad.  Everything after -- the encounter pic and the survey HUD -- stays
-  -- flat, the same split the Gen 1 renderer makes.
-  if Tilt.active() and self:tiltMesh() then
-    self:drawTilted(w, h, s)
+  -- flat, the same split the Gen 1 renderer makes; a pipeline's finished image
+  -- lands in exactly the same place.
+  if override then
+    G.setColor(1, 1, 1, 1)
+    G.draw(override, 0, 0)
+  elseif tilt then
+    self:drawTilted(w, h, s, gw, gh)
   else
     self:drawWorldBody(s)
   end

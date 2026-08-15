@@ -45,7 +45,12 @@ local Boot    = loadModule("src/update/Boot.lua")
 local cmdCh   = love.thread.getChannel("update_check_cmd")
 local stateCh = love.thread.getChannel("update_check_state")
 
-local function post(t) stateCh:push(t) end
+local function post(t)
+  if pending and type(t) == "table" and t.notes == nil then
+    t.notes = pending.notes
+  end
+  stateCh:push(t)
+end
 
 local osName    = (love.system and love.system.getOS and love.system.getOS()) or ""
 local isWindows = osName == "Windows"
@@ -80,7 +85,10 @@ local function curlCapture(url)
   local pipe = HostShell.popen(cmd)
   if not pipe then return nil end
   local out = pipe:read("*a")
-  pipe:close()
+  -- HostShell.pclose, not pipe:close(): a close outside the spawn lock can
+  -- free a FILE while another thread's popen walks the stream list, which
+  -- deadlocks that thread permanently (see HostShell's popen notes).
+  HostShell.pclose(pipe)
   if not out or out == "" then return nil end
   return out
 end
@@ -89,7 +97,7 @@ local function haveCurl()
   local pipe = HostShell.popen("curl --version")
   if not pipe then return false end
   local out = pipe:read("*a")
-  pipe:close()
+  HostShell.pclose(pipe)
   return out ~= nil and out:find("curl", 1, true) ~= nil
 end
 
@@ -150,8 +158,9 @@ local function gatePasses(rel)
   local info = Boot.probePayload(rel)
   if not info then return true end
   local shell = (Version and Version.shell) or 1
-  if info.minShell and info.minShell > shell then return false end
-  return true
+  local payloadHost = (Version and Version.payloadHost) or "love"
+  if Boot.canHost then return Boot.canHost(info, shell, payloadHost) end
+  return not (info.minShell and info.minShell > shell)
 end
 
 -- ---------------------------------------------------------------------------
@@ -234,6 +243,11 @@ local function launchDownload(url, partAbs, doneAbs)
     local batRel = "updates/dl.bat"
     love.filesystem.write(batRel,
       "@echo off\r\n"
+      -- start /b hands the child our cwd, the install folder, and the
+      -- detached cmd.exe held that folder un-movable for the rest of the
+      -- transfer after the game exited (#727).  Every path below is
+      -- absolute, so park the child in its own directory (the save dir).
+      .. "cd /d \"%~dp0\"\r\n"
       .. "curl -fsSL --connect-timeout 15 --max-time 900 -o \""
       .. partAbs .. "\" \"" .. url .. "\"\r\n"
       .. "type nul > \"" .. doneAbs .. "\"\r\n")
@@ -271,6 +285,14 @@ local function doDownload()
   -- stalled or run-away transfer breaks out and lets verification fail cleanly
   local waited, lastSize, lastChange = 0, -1, 0
   while true do
+    -- A queued quit means the window already closed.  Bail so the join in
+    -- Check.shutdown does not hold the dead window's process (and, on
+    -- Windows, its folder) open for up to the whole transfer (#727).  The
+    -- quit stays on the channel for the command loop; the detached curl
+    -- times out on its own and the next launch's doCheck verifies and
+    -- re-offers whatever landed.
+    local peeked = cmdCh:peek()
+    if type(peeked) == "table" and peeked.cmd == "quit" then return end
     if love.filesystem.getInfo(doneRel) then break end
     local pinfo = love.filesystem.getInfo(partRel)
     local cur = (pinfo and pinfo.size) or 0

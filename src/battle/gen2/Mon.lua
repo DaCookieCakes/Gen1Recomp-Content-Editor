@@ -49,35 +49,6 @@ function Mon.randomDVs()
   }
 end
 
--- ATKDEFDV_SHINY $EA / SPDSPCDV_SHINY $AA — the pair InitEnemyMon forces for
--- BATTLETYPE_FORCESHINY (Red Gyarados).  Catchable shinies need these DVs, not
--- only a shiny flag.
-function Mon.shinyDVs()
-  return {
-    attack = 14, defense = 10, speed = 10, special = 10,
-  }
-end
-
--- Roll DVs for a newly built mon when the caller did not supply opts.dvs.
--- data.shinyRate is the shiny denominator (vanilla ~8192).  When unset, keep
--- cart behavior: random DVs and Mon.vanillaShiny's DV pattern.  When set, use
--- an exact 1/rate roll and force Mon.shinyDVs so the flag and the DVs match.
-function Mon.rollEncounterDVs(data)
-  local rate = tonumber(data and data.shinyRate)
-  if not rate or rate < 1 then
-    return Mon.randomDVs()
-  end
-  rate = math.floor(rate)
-  if rand(1, rate) == 1 then
-    return Mon.shinyDVs()
-  end
-  local dvs
-  repeat
-    dvs = Mon.randomDVs()
-  until not Mon.vanillaShiny(dvs)
-  return dvs
-end
-
 -- The HP DV is not stored: it is the low bit of each of the other four
 -- (Gen 1 and 2 both build it this way), which is why a perfect-HP mon needs
 -- all four others odd.
@@ -97,7 +68,16 @@ function Mon.stats(baseStats, dvs, level, statExp)
   baseStats = baseStats or {}
   dvs = dvs or {}
   statExp = statExp or {}
-  local hpDv = dvs.hp or Mon.hpDV(dvs)
+  -- engine/pokemon/move_mon.asm:1540
+  local specialDv = dvs.special
+  if specialDv == nil then
+    specialDv = dvs.specialAttack or dvs.specialDefense
+  end
+  -- engine/pokemon/move_mon.asm:1496
+  local hpDv = Mon.hpDV({
+    attack = dvs.attack, defense = dvs.defense,
+    speed = dvs.speed, special = specialDv,
+  })
   local hp = math.floor((((baseStats.hp or 1) * 2 + hpDv * 2
     + math.floor(math.sqrt(statExp.hp or 0) / 4)) * level) / 100)
     + level + 10
@@ -111,11 +91,84 @@ function Mon.stats(baseStats, dvs, level, statExp)
     -- box_struct ends them at SpcExp), so SpA and SpD grow together.  The
     -- per-stat keys are still read as a fallback for a record written before
     -- the shared word existed.
-    specialAttack = statValue(baseStats.specialAttack, dvs.special, level,
+    specialAttack = statValue(baseStats.specialAttack, specialDv, level,
       statExp.special or statExp.specialAttack),
-    specialDefense = statValue(baseStats.specialDefense, dvs.special, level,
+    specialDefense = statValue(baseStats.specialDefense, specialDv, level,
       statExp.special or statExp.specialDefense),
   }
+end
+
+-- The species string is the source of truth.  `mon.name` is a copy of that
+-- species' display name (GetPokemonName), kept so menus can print without a
+-- Data lookup.  It is NOT the nickname: an un-nicknamed mon has nickname nil
+-- and prints this copy.  Changing species without rewriting it leaves the
+-- previous species' name on the party list and the SUMMARY's top line.
+function Mon.syncIdentity(mon, data)
+  if type(mon) ~= "table" then return mon end
+  local def = data and data.pokemon and data.pokemon[mon.species]
+  if not def then return mon end
+  mon.name = def.name or mon.species
+  if def.types then mon.types = def.types end
+  if mon.dvs then
+    mon.gender = Mon.gender(def, mon.dvs,
+      { species = mon.species, level = mon.level })
+    mon.shiny = Mon.isShiny(mon.dvs,
+      { species = mon.species, def = def, level = mon.level })
+    if mon.species == Unown.SPECIES then
+      mon.unownLetter = Unown.letterFromDVs(mon.dvs)
+    else
+      mon.unownLetter = nil
+    end
+  end
+  return mon
+end
+
+-- Every screen that prints a mon without a Data lookup should go through here:
+-- nickname if the player set one, otherwise the species display copy `name`.
+-- Skipping `name` and jumping to `species` is how a swapped mon can still
+-- read as ABRA on one menu and RAYQUAZA on another.
+function Mon.displayName(mon)
+  if type(mon) ~= "table" then return "?" end
+  return mon.nickname or mon.name or mon.species or "?"
+end
+
+-- Party, boxes, both Day-Care sides, and a pending egg.  Editor CONTINUE and
+-- hydrate have to walk the same set: leaving dayCare.man.mon on the old
+-- `name` is the ABRA bug in a second closet.
+function Mon.eachSaveMon(save, fn)
+  if type(save) ~= "table" or type(fn) ~= "function" then return end
+  for _, mon in ipairs(save.party or {}) do fn(mon) end
+  for _, box in pairs(save.boxes or {}) do
+    if type(box) == "table" then
+      for _, mon in ipairs(box) do fn(mon) end
+    end
+  end
+  local dc = save.dayCare
+  if type(dc) == "table" then
+    if dc.man and dc.man.mon then fn(dc.man.mon) end
+    if dc.lady and dc.lady.mon then fn(dc.lady.mon) end
+    if dc.egg then fn(dc.egg) end
+  end
+  if save.daycare and save.daycare.mon then fn(save.daycare.mon) end
+end
+
+function Mon.syncSaveIdentity(save, data)
+  Mon.eachSaveMon(save, function(mon) Mon.syncIdentity(mon, data) end)
+end
+
+function Mon.refreshStats(mon, data)
+  if type(mon) ~= "table" then return mon end
+  local def = data and data.pokemon and data.pokemon[mon.species]
+  if not (def and def.baseStats) then return mon end
+  Mon.syncIdentity(mon, data)
+  -- engine/pokemon/move_mon.asm:1402
+  local stats = Mon.stats(def.baseStats, mon.dvs, mon.level or 1, mon.statExp)
+  mon.stats = stats
+  mon.maxHp = stats.hp
+  if mon.hp == nil or mon.hp > stats.hp then
+    mon.hp = stats.hp
+  end
+  return mon
 end
 
 -- The five stat exp words, in struct order.  There is no sixth: see Mon.stats.
@@ -274,7 +327,7 @@ function Mon.new(data, species, level, opts)
   local def = data and data.pokemon and data.pokemon[species]
   if not def then return nil end
   level = math.max(1, math.min(Mon.MAX_LEVEL, level or 5))
-  local dvs = opts.dvs or Mon.rollEncounterDVs(data)
+  local dvs = opts.dvs or Mon.randomDVs()
   dvs.hp = Mon.hpDV(dvs)
   local statExp = opts.statExp or Mon.newStatExp()
   local stats = Mon.stats(def.baseStats, dvs, level, statExp)

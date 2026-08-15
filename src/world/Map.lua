@@ -24,6 +24,13 @@ local NO_SHORE_TILESETS = { SHIP_PORT = true }
 -- what counts as "outside" for the wLastMap memory (CheckIfInOutsideMap)
 local OUTSIDE_TILESETS = { "OVERWORLD", "PLATEAU" }
 
+-- pokered's fly destination gate: BuildFlyLocationsList
+-- (engine/items/town_map.asm) walks map ids 0..NUM_CITY_MAPS-1, the eleven
+-- towns PALLET_TOWN..SAFFRON_CITY, so routes never appear even though
+-- ROUTE_4/ROUTE_10 carry fly-warp landing spots (those exist for the
+-- dungeon-escape/heal tables, special_warps.asm FlyWarpDataPtr)
+local NUM_CITY_MAPS = 11
+
 -- warp pads and fall-through holes (data/tilesets/warp_pad_hole_tile_ids
 -- .asm WarpPadAndHoleData); a tileset record carrying warpPadTiles
 -- ({ [tileId] = "pad"|"hole" }) wins over these vanilla rows
@@ -110,30 +117,17 @@ function Map.new(def, tilesetDef)
   self.widthCells = def.width * 2
   self.heightCells = def.height * 2
 
-  -- Gold tilesets carry COLL_* quads (`collision`) and no Gen 1 walkable /
-  -- doorTiles lists.  Tolerate nil so MapLoader / the content editor can
-  -- still build a Map for preview; walkability then falls through to
-  -- empty sets (or callers use src/world/gen2/Map.lua).
   self.walkable = {}
-  for _, t in ipairs(tilesetDef.walkable or {}) do self.walkable[t] = true end
+  for _, t in ipairs(tilesetDef.walkable) do self.walkable[t] = true end
   self.doorTiles = {}
   for _, t in ipairs(tilesetDef.doorTiles or {}) do self.doorTiles[t] = true end
   self.warpTiles = {}
   for _, t in ipairs(tilesetDef.warpTiles or {}) do self.warpTiles[t] = true end
   -- water and shore share one lookup: both are surfable, only the caller's
   -- water_tilesets.asm membership check separates them
-  -- Gen 2 tilesets omit these; keep empty rather than inventing Gen 1 ids.
-  local waterSrc = tilesetDef.waterTiles
-  if waterSrc == nil and tilesetDef.collision then
-    waterSrc = {}
-  end
-  self.waterTiles = hashSet(waterSrc or WATER_TILES, {})
+  self.waterTiles = hashSet(tilesetDef.waterTiles or WATER_TILES, {})
   local shore = tilesetDef.shoreTiles
-  if shore == nil and tilesetDef.collision then
-    shore = {}
-  elseif shore == nil and not NO_SHORE_TILESETS[def.tileset] then
-    shore = SHORE_TILES
-  end
+  if shore == nil and not NO_SHORE_TILESETS[def.tileset] then shore = SHORE_TILES end
   hashSet(shore or {}, self.waterTiles)
 
   self.warpAt = {}
@@ -150,31 +144,31 @@ end
 -- ------- map record properties (authored maps set them; vanilla falls back)
 
 -- town/route surface: door SFX, the walk-out step, the Fly menu and the
--- town map all mean this one.
--- Content editor "Outside / Inside / Cave" writes def.environment
--- (and keeps def.outdoor in sync for older mods).
+-- town map all mean this one
 function Map.isOutdoor(def)
-  if type(def) ~= "table" then return false end
-  local env = def.environment
-  if env == "outside" then return true end
-  if env == "inside" or env == "cave" then return false end
   if def.outdoor ~= nil then return def.outdoor end
   return def.tileset == "OVERWORLD"
 end
 
 -- CheckIfInOutsideMap, a strictly wider set: Route 23 / Indigo Plateau are
--- outside for the wLastMap memory without being outdoor for the door SFX.
--- Cave / Inside maps are never "outside" (indoor wilds, LAST_MAP, etc.).
+-- outside for the wLastMap memory without being outdoor for the door SFX
 function Map.isOutside(def, tilesets)
-  if type(def) ~= "table" then return false end
-  local env = def.environment
-  if env == "outside" then return true end
-  if env == "inside" or env == "cave" then return false end
   if Map.isOutdoor(def) then return true end
   for _, ts in ipairs(tilesets or OUTSIDE_TILESETS) do
     if ts == def.tileset then return true end
   end
   return false
+end
+
+-- FLY destination (LoadTownMap_Fly / BuildFlyLocationsList): the eleven
+-- towns, map indices 0..NUM_CITY_MAPS-1.  ROUTE_4 and ROUTE_10 are outdoor
+-- and have fly warps but are not towns, so the outdoor test alone offered
+-- their Pokemon Centers as fly targets (#788).  Maps without a vanilla
+-- index (mod-authored) keep the old outdoor/PLATEAU surface test, which is
+-- how a mod adds its own fly town.
+function Map.isFlyTown(def)
+  if def.index ~= nil then return def.index < NUM_CITY_MAPS end
+  return Map.isOutdoor(def) or def.tileset == "PLATEAU"
 end
 
 -- region groups maps a rule applies to without naming them; the id prefix

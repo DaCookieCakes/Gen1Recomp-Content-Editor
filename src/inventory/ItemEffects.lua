@@ -25,6 +25,18 @@ local function noEffect(data)
   return romText(data, "_ItemUseNoEffectText", "It won't have\nany effect.")
 end
 
+local function registeredEffect(data, itemDef)
+    if not data or not itemDef or not itemDef.effect then
+        return nil
+    end
+
+    if not data.item_effects then
+        return nil
+    end
+
+    return data.item_effects[itemDef.effect]
+end
+
 local HEAL_AMOUNT = {
   POTION = 20, SUPER_POTION = 50, HYPER_POTION = 200,
   FRESH_WATER = 50, SODA_POP = 60, LEMONADE = 80,
@@ -51,13 +63,13 @@ local STONES = {
 local VITAMINS = { HP_UP = "hp", PROTEIN = "attack", IRON = "defense",
                    CARBOS = "speed", CALCIUM = "special" }
 
+-- REPEL / SUPER_REPEL / MAX_REPEL all funnel through ItemUseRepelCommon,
+-- which refuses mid-battle before writing wRepelRemainingSteps (#894)
+local REPELS = { REPEL = true, SUPER_REPEL = true, MAX_REPEL = true }
+
 ItemEffects.BALLS = BALLS
 
-function ItemEffects.isBall(id, itemDef)
-  if BALLS[id] then return true end
-  if itemDef and itemDef.ball then return true end
-  return false
-end
+function ItemEffects.isBall(id) return BALLS[id] or false end
 function ItemEffects.isStone(id) return STONES[id] or false end
 
 -- Does using this item take item_effects.asm's .healHP path, the one that
@@ -72,10 +84,18 @@ function ItemEffects.healsHP(id)
 end
 
 -- Does this item need a party-member target?
-function ItemEffects.needsTarget(id, itemDef)
+-- 'data' is optional for compat purposes; targeting falls back to itemDef/vanilla detection
+function ItemEffects.needsTarget(id, itemDef, data)
   if itemDef and itemDef.needsTarget ~= nil then
-    return itemDef.needsTarget and true or false
+      return itemDef.needsTarget
   end
+
+  local effect = registeredEffect(data, itemDef)
+
+  if effect and effect.needsTarget ~= nil then
+    return effect.needsTarget
+  end
+
   return HEAL_AMOUNT[id] or STATUS_HEAL[id] or id == "MAX_POTION"
       or id == "FULL_RESTORE" or id == "REVIVE" or id == "MAX_REVIVE"
       or id == "RARE_CANDY" or STONES[id]
@@ -150,31 +170,39 @@ function ItemEffects.use(data, save, itemId, target, battle, moveIndex, ow)
   local itemDef = data.items[itemId]
   local name = itemDef and itemDef.name or itemId
 
-  -- Mod-registered item_effects win over the stock id tables so content
-  -- authored through the editor (or hand-written mods) can define behavior
-  -- without patching this file.
-  if itemDef and itemDef.effect and data.item_effects then
-    local effect = data.item_effects[itemDef.effect]
-    if effect and type(effect.use) == "function" then
-      if battle and effect.battle == false then
+  local effectDef = registeredEffect(data, itemDef)
+  if effectDef then
+    if battle and effectDef.battle == false then
         return "failed", { notTime(data, save) }
-      end
-      if not battle and effect.field == false then
-        return "failed", { notTime(data, save) }
-      end
-      return effect.use(data, save, itemId, target, battle, moveIndex, ow)
     end
+
+    if not battle and effectDef.field == false then
+        return "failed", { notTime(data, save) }
+    end
+
+    return effectDef.use({
+        data = data,
+        save = save,
+        itemId = itemId,
+        item = itemDef,
+        target = target,
+        battle = battle,
+        moveIndex = moveIndex,
+        overworld = ow,
+    })
   end
 
   -- ItemUseVitamin / ItemUsePPUp / ItemUseEvoStone / ItemUseCoinCase /
-  -- ItemUseTMHM all refuse mid-battle (jp nz, ItemUseNotTime)
+  -- ItemUseTMHM / ItemUseRepelCommon all refuse mid-battle
+  -- (jp nz, ItemUseNotTime)
   if battle and (VITAMINS[itemId] or STONES[itemId] or itemId == "PP_UP"
                  or itemId == "RARE_CANDY" or itemId == "COIN_CASE"
+                 or REPELS[itemId]
                  or (itemDef and itemDef.machine)) then
     return "failed", { notTime(data, save) }
   end
 
-  if BALLS[itemId] or (itemDef and itemDef.ball) then
+  if BALLS[itemId] then
     return "ball"
   end
 
@@ -182,6 +210,17 @@ function ItemEffects.use(data, save, itemId, target, battle, moveIndex, ow)
   -- (ItemUsePokeFlute, engine/items/item_effects.asm); never consumed.
   if itemId == "POKE_FLUTE" then
     if not battle then
+      if ow and ow.map and ow.map.id == "PEWTER_POKECENTER"
+          and ow.pikachuPewterSleepScene then
+        local Follower = require("src.world.PikachuFollower")
+        local pika = Follower.current(ow)
+        local player = ow.player
+        if pika and player
+            and math.abs(pika.cellX - player.cellX) + math.abs(pika.cellY - player.cellY) == 1 then
+          return "flute_wake_pikachu", { romText(data, "_PlayedFluteHadEffectText",
+            "{PLAYER} played the\nPOKé FLUTE.") }
+        end
+      end
       -- standing next to a not-yet-beaten Snorlax: this is the ONLY way
       -- Snorlax wakes -- using the flute from the item-use menu, never
       -- just talking to it with the flute in the bag (see
@@ -512,6 +551,13 @@ function ItemEffects.use(data, save, itemId, target, battle, moveIndex, ow)
     if battle then
       return "failed", { notTime(data, save) }
     end
+    -- ItemUseBicycle (engine/items/item_effects.asm) opens with
+    -- `cp 2 ; is the player surfing?` -> jp z, ItemUseNotTime, so the
+    -- BICYCLE refuses on the water with the same OAK text as the rods
+    -- above (#846)
+    if ow and ow.player and ow.player.surfing then
+      return "failed", { notTime(data, save) }
+    end
     return "bicycle"
   end
 
@@ -534,7 +580,7 @@ function ItemEffects.use(data, save, itemId, target, battle, moveIndex, ow)
     return "failed", { romText(data, "_CoinCaseNumCoinsText",
       "Coin count:\n%d", save.coins or 0) }
   end
-  if itemId == "REPEL" or itemId == "SUPER_REPEL" or itemId == "MAX_REPEL" then
+  if REPELS[itemId] then
     local steps = itemId == "REPEL" and 100 or itemId == "SUPER_REPEL" and 200 or 250
     save.repelSteps = steps
     return "consumed", { Strings("%s used\n%s!", save.player.name, name) }

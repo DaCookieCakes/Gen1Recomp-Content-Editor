@@ -604,70 +604,6 @@ PaletteFX.TILE_ALIASES = {
 local ROOF_GROUP = 6
 local ROUTE_6_SAFFRON = { mapId = "ROUTE_6", useMapId = "SAFFRON_CITY", cellYBelow = 2 }
 
--- pokered-gbc LoadTilesetPalette slot names (group index 0–7).
-PaletteFX.WORLD_GROUP_NAMES = {
-  "GRAY", "RED", "GREEN", "BLUE", "YELLOW", "BROWN", "ROOF", "TEXT",
-}
-
--- Sparse mod/editor overrides: tilesetId -> { [1..8] = 4×{r,g,b} or nil }.
--- Applied in worldGroupColors without mutating the cached palettes_gbc pack.
-local worldGroupOverrides = nil
-
-local function cloneGroup4(src)
-  if type(src) ~= "table" then return nil end
-  local out = {}
-  for i = 1, 4 do
-    local c = src[i] or { 0, 0, 0 }
-    if c.r then out[i] = { c.r, c.g, c.b }
-    else out[i] = { c[1] or 0, c[2] or 0, c[3] or 0 } end
-  end
-  return out
-end
-
-local function cloneGroups8(src)
-  if type(src) ~= "table" then return nil end
-  local out = {}
-  for i = 1, 8 do out[i] = cloneGroup4(src[i]) or {
-    { 255, 255, 255 }, { 168, 168, 168 }, { 88, 88, 88 }, { 0, 0, 0 },
-  } end
-  return out
-end
-
--- Drop RED++ baked atlases + live maps after world palette overrides change.
-local function invalidateWorldColorCaches()
-  pcall(function()
-    local TileRenderer = require("src.render.TileRenderer")
-    if TileRenderer.clearGbcAtlasCache then TileRenderer.clearGbcAtlasCache() end
-    if TileRenderer.invalidate then TileRenderer.invalidate() end
-  end)
-  pcall(function()
-    require("src.world.MapLoader").invalidateAll()
-  end)
-  pcall(function()
-    require("src.render.SpriteRenderer").invalidate()
-  end)
-end
-
--- overrides: { [tilesetId] = { [1..8] = 4×{r,g,b} } } or nil to clear.
-function PaletteFX.setWorldGroupOverrides(overrides)
-  if type(overrides) ~= "table" or not next(overrides) then
-    worldGroupOverrides = nil
-  else
-    local clean = {}
-    for ts, groups in pairs(overrides) do
-      if type(ts) == "string" and type(groups) == "table" then
-        clean[ts] = cloneGroups8(groups)
-      end
-    end
-    worldGroupOverrides = next(clean) and clean or nil
-  end
-  invalidateWorldColorCaches()
-end
-
-function PaletteFX.worldGroupOverrides()
-  return worldGroupOverrides
-end
-
 -- whether the extracted pack has real per-tile GBC data for this tileset
 -- (false for a mod tileset with no pokered-gbc counterpart, or when the
 -- pack failed to load at all)
@@ -675,14 +611,6 @@ function PaletteFX.hasWorldTileset(tileset)
   local pack = PaletteFX.gbcPack()
   local w = pack and pack.world
   return (w and w.tileGroups[tileset]) ~= nil
-end
-
--- Vanilla (pack) 8×4 colors for a tileset, or nil.
-function PaletteFX.vanillaWorldGroupColors(tileset)
-  local pack = PaletteFX.gbcPack()
-  local base = pack and pack.world and pack.world.groupColors
-    and pack.world.groupColors[tileset]
-  return cloneGroups8(base)
 end
 
 -- the palette-group (0-7) a tile GRAPHIC id resolves to in this tileset,
@@ -708,12 +636,6 @@ function PaletteFX.worldGroupColors(data, tileset, mapId, playerCellY)
   local w = pack and pack.world
   local base = w and w.groupColors[tileset]
   if not base then return nil end
-  local ov = worldGroupOverrides and worldGroupOverrides[tileset]
-  if ov then
-    local merged = {}
-    for i = 1, 8 do merged[i] = ov[i] or base[i] end
-    base = merged
-  end
   if not w.roofGroup[tileset] then return darkGroups(base) end
   local roofMapId = mapId
   if mapId == ROUTE_6_SAFFRON.mapId and playerCellY
@@ -769,10 +691,12 @@ function PaletteFX.spriteObp(spriteDef, seed)
   return PaletteFX.darkObp(w.spritePalettes[group], group)
 end
 
--- GetHealthBarColor (home/palettes.asm) on the standard 48px bar
-function PaletteFX.barPalName(hp, maxHp)
-  local px = maxHp > 0 and math.floor(hp * 48 / maxHp) or 0
-  if hp > 0 and px < 1 then px = 1 end
+-- GetHealthBarColor (home/palettes.asm) on the standard 48px bar.  It reads
+-- the bar's own length, so a caller mid-drain passes the animated `pixels`
+-- rather than let it be re-derived from hp.
+function PaletteFX.barPalName(hp, maxHp, pixels)
+  local px = pixels or (maxHp > 0 and math.floor(hp * 48 / maxHp) or 0)
+  if not pixels and hp > 0 and px < 1 then px = 1 end
   return px >= 27 and "GREENBAR" or px >= 10 and "YELLOWBAR" or "REDBAR"
 end
 
@@ -940,6 +864,22 @@ end
 function PaletteFX.sendColors(shader, c)
   c = PaletteFX.effectiveColors(c)
   if not c then return end
+  shader:send("c0", { c[1][1] / 255, c[1][2] / 255, c[1][3] / 255 })
+  shader:send("c1", { c[2][1] / 255, c[2][2] / 255, c[2][3] / 255 })
+  shader:send("c2", { c[3][1] / 255, c[3][2] / 255, c[3][3] / 255 })
+  shader:send("c3", { c[4][1] / 255, c[4][2] / 255, c[4][3] / 255 })
+end
+
+-- The same send with NO display-mode substitution and no shade map: the four
+-- colors reach the shader exactly as given.  Only for an INTERMEDIATE pass
+-- whose output is re-thresholded downstream -- the classic battle's zone pass
+-- under a forced-mono mode, where ensureZones' whole-screen zone already
+-- substitutes once at blit time and doing it again here applies the mode
+-- twice (#822).  Everything that draws a final pixel wants sendColors.
+function PaletteFX.sendShades(shader, c)
+  -- headless (no love.graphics) leaves shader() nil; sendColors reaches the
+  -- same no-op through effectiveColors returning nil for an absent palette
+  if not shader or not c then return end
   shader:send("c0", { c[1][1] / 255, c[1][2] / 255, c[1][3] / 255 })
   shader:send("c1", { c[2][1] / 255, c[2][2] / 255, c[2][3] / 255 })
   shader:send("c2", { c[3][1] / 255, c[3][2] / 255, c[3][3] / 255 })

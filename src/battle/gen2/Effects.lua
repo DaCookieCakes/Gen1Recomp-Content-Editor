@@ -100,21 +100,28 @@ end
 -- are 1/8 each, which is what the `and 3` on a 0-3 roll plus the two-step
 -- fallthrough in .DetermineNumberOfHits produces.
 function Effects.multiHitCount(random)
-  local roll = random and random(4) or 0
-  if roll < 2 then return roll + 2 end
-  -- Hits 4 and 5 take a second roll, so each ends up half as likely.
-  local second = random and random(2) or 0
-  return second + 4
+  local function roll(n)
+    if random then return random(n) end
+    if love and love.math and love.math.random then
+      return love.math.random(n) - 1
+    end
+    return math.random(n) - 1
+  end
+  -- engine/battle/effect_commands.asm:5228
+  local first = roll(4)
+  if first < 2 then return first + 2 end
+  return roll(4) + 2
 end
 
 Effects.HIT_COUNTS = {
   EFFECT_DOUBLE_HIT = 2,
+  EFFECT_POISON_MULTI_HIT = 2,
   -- Triple Kick stops early if a hit misses; Battle rolls that per hit.
   EFFECT_TRIPLE_KICK = 3,
 }
 
 function Effects.hitCount(effect, random)
-  if effect == "EFFECT_MULTI_HIT" or effect == "EFFECT_POISON_MULTI_HIT" then
+  if effect == "EFFECT_MULTI_HIT" then
     return Effects.multiHitCount(random)
   end
   return Effects.HIT_COUNTS[effect] or 1
@@ -172,9 +179,9 @@ end
 
 -- --------------------------------------------------------------- fixed damage
 
--- BattleCommand_LevelDamage / SuperFang / Psywave, all of which skip the
--- damage formula entirely.
-function Effects.fixedDamage(effect, attacker, defender, random)
+-- BattleCommand_ConstantDamage (engine/battle/effect_commands.asm:3131-3205),
+-- one command for the whole SuperFang / Psywave / StaticDamage list.
+function Effects.fixedDamage(effect, attacker, defender, random, power)
   if effect == "EFFECT_LEVEL_DAMAGE" then
     return math.max(1, attacker.level or 1)
   end
@@ -182,9 +189,17 @@ function Effects.fixedDamage(effect, attacker, defender, random)
     return math.max(1, math.floor((defender.hp or 1) / 2))
   end
   if effect == "EFFECT_PSYWAVE" then
-    -- 1..(level * 1.5), rerolled until it is in range; one roll is enough here.
-    local ceiling = math.max(1, math.floor((attacker.level or 1) * 3 / 2))
-    return math.max(1, (random and random(ceiling) or 0) + 1)
+    -- .psywave rerolls until the byte is nonzero AND below level * 1.5, so the
+    -- top of the range is that ceiling minus one (effect_commands.asm:3163).
+    local ceiling = math.max(2, math.floor((attacker.level or 1) * 3 / 2))
+    return math.max(1, (random and random(ceiling - 1) or 0) + 1)
+  end
+  -- SONIC BOOM and DRAGON RAGE share EFFECT_STATIC_DAMAGE, whose arm reads
+  -- BATTLE_VARS_MOVE_POWER straight into the damage word: their stored power
+  -- (20 and 40) IS the damage, never a formula input
+  -- (effect_commands.asm:3157-3161).
+  if effect == "EFFECT_STATIC_DAMAGE" then
+    return math.max(1, math.floor(power or 0))
   end
   return nil
 end
@@ -250,8 +265,18 @@ Effects.MAGNITUDE_POWER = {
 -- is what damagecalc reads as the move's power -- data/moves/moves.asm stores
 -- MAGNITUDE at power 1 precisely because this overwrites it.  Returns the
 -- power and the magnitude number the text prints.
+--
+-- `random` is BattleRandom (0..n-1).  If none is supplied, roll via love.math
+-- / math.random — never hard-code 0 (that always yields Magnitude 4).
 function Effects.magnitudePower(random)
-  local roll = random and random(256) or 0
+  local roll
+  if type(random) == "function" then
+    roll = random(256) or 0
+  elseif love and love.math and love.math.random then
+    roll = love.math.random(256) - 1
+  else
+    roll = math.random(256) - 1
+  end
   for _, row in ipairs(Effects.MAGNITUDE_POWER) do
     if row[1] >= roll then return row[2], row[3] end
   end
